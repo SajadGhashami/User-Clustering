@@ -1,0 +1,288 @@
+---
+title: "Second version hi low"
+author: "Sajad Ghashami"
+date: "10/19/2021"
+output: 
+  html_document:
+           code_folding: show
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## First specify the packages of interest
+packages = c("tidyverse", "timetk",
+             "modeltime", "miniUI", "shiny", "shinyFiles", "lubridate", "DBI","dbplyr",
+             "tidymodels", "parsnip", "rsample", "rmarkdown", "knitr", "factoextra",  
+             "NbClust", "plotly"  )
+
+## Now load or install&load all
+package.check <- lapply(
+  packages,
+  FUN = function(x) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+)
+
+
+```
+
+## Connecting to database and Pulling the data
+
+First we need to connect to database and pull the WAU/QUA for each day
+
+```{r mydata, message=TRUE, warning=TRUE, cashe=TRUE}
+con <- DBI::dbConnect(odbc::odbc(),
+                      Driver       = "SnowflakeDSIIDriver",
+                      Server       = "ed87949.us-east-1.snowflakecomputing.com",
+                      UID          = rstudioapi::askForPassword("Database user"),
+                      PWD          = rstudioapi::askForPassword("Database password"),
+                      Database     = "EDW",
+                      Warehouse    = "INTEGRATE_LARGE_TEST",
+                      Schema       = "dim")
+mywh <- DBI::dbSendQuery(con, 'use role developer_role')
+mywh <- DBI::dbSendQuery(con, 'use warehouse INTEGRATE_LARGE_TEST')
+mydata <- DBI::dbGetQuery(con, "
+
+WITH part_1 AS (
+SELECT 
+      tdac.user_id,
+      tdac.census_date,
+      '2020-10-01' as mindate,
+      '2021-03-30' as maxdate,
+  tdac.ACTIVE_PAID_PRODUCT_SUBJECT_MATCH_ONLY as active,
+      datediff(day, mindate, maxdate) as total_days
+      
+FROM  EDW.FACT.TEACHER_DAILY_ACTIVITY_COHORTS tdac
+
+WHERE tdac.is_target_teacher = 1
+  AND tdac.is_paid = 1
+  AND tdac.TEACHER_SUBJECT_PRODUCT_MATCH=1
+  AND census_date BETWEEN mindate AND maxdate --Only Q4 and Q1
+--  AND user_id='36037830'
+  
+  --AND user_id='2019666579'
+-- low example
+  --AND user_id='2019652867' 
+-- high_example
+   --  AND user_id='23984990'
+--SELECt min(census_date) from EDW.FACT.TEACHER_DAILY_ACTIVITY_COHORTS  where user_id='2019652867'
+GROUP BY 1,2,3,4, 5
+ORDER BY user_id, CENSUS_DATE
+--  limit 100
+  ),
+  
+  part_middle as (
+  SELECT tdac.USER_ID,
+    min(tdac.census_date) as user_min_date
+    from EDW.FACT.TEACHER_DAILY_ACTIVITY_COHORTS tdac
+    JOIN part_1
+    on tdac.USER_ID=part_1.USER_ID
+    where tdac.census_date>=mindate
+    
+    GROUP BY 1
+  )
+,
+part_2 AS (
+SELECT part_1.user_id,
+       part_1.census_date,
+       total_days,
+       pm.user_min_date,
+       sum(active) as active,
+       datediff(day, pm.user_min_date,  max(maxdate))+1                            AS total_count,
+       datediff(day, greatest(min(mindate),pm.user_min_date),part_1.census_date)+1 as days_to_min,
+       CASE WHEN sum(active)>0 then days_to_min
+       ELSE 0
+       END as counted_days
+FROM part_1
+JOIN part_middle as pm
+on pm.user_id=part_1. user_id
+
+GROUP BY 1, 2, 3, 4
+order by 1,2
+)
+,
+
+rec as (
+SELECT  part_2.user_id,
+       sum(counted_days) as rec_value,
+       AVG(total_count)*(AVG(total_count)+1)/2 as total_value,
+       DIV0(sum(counted_days),AVG(total_count)*(AVG(total_count)+1)/2) as recency
+       FROM part_2
+       GROUP by 1
+       order by 4 desc
+       
+),
+
+
+ raw_duration as (
+  SELECT _USER_ID as newsela_user_id,
+  user_ID as heap_user_id,
+  session_ID,
+  date_trunc('DAY', min(time)) as session_date,
+  min(time), max(time),
+  datediff(minute, min(time),max(time)) as duration
+FROM HEAP_MAIN_PRODUCTION.HEAP.PAGEVIEWS
+--where role='teacher'
+  WHERE 
+   --_USER_ID=10722826 
+   --AND _USER_ID= 14519713
+   --AND _USER_ID=2608425
+--   AND _USER_ID=10000362
+ -- OR _USER_ID=2019430414)
+   time >= '2020-10-01'
+    AND  time <= '2021-03-30'
+GROUP by _USER_ID, user_ID, session_ID
+order by _USER_ID, user_ID, session_ID
+
+),
+
+duration as (
+select newsela_user_id,  sum(duration) as mins_spent
+from raw_duration
+group by 1
+ order by 1
+)
+--,
+--final_table as (
+SELECT part_2.USER_ID, sum(ACTIVE)/AVG(total_days) as perc_active, AVG(rec.RECENCY) as RECENCY, zeroifnull(AVG(duration.mins_spent)) as duration_min
+FROM part_2
+LEFT JOIN duration
+on part_2.USER_ID=duration.newsela_user_id
+INNER JOIN rec
+on part_2.USER_ID=rec.USER_ID
+--HAVING RECENCY IS NOT NULL
+GROUP BY 1
+order by 1 desc
+")
+dbDisconnect(con)
+```
+
+## How the Data Looks like
+
+```{r pressure, echo=FALSE}
+set.seed(27)
+head(mydata) %>% kable()
+```
+
+### Summary of table
+
+```{r}
+mydata %>% summary() %>% kable()
+```
+
+```{r}
+points <- mydata %>% select (USER_ID,PERC_ACTIVE,RECENCY,DURATION_MIN)
+zeroactive <- points %>% filter(PERC_ACTIVE==0 | DURATION_MIN==0)
+points <- points %>%  filter(PERC_ACTIVE>0 & DURATION_MIN>0)
+rownames(points) <- points$USER_ID
+scale2 <- function(x, na.rm = FALSE) (x - mean(x, na.rm = na.rm)) / sd(x, na.rm)
+points <- points %>% mutate(across(c(PERC_ACTIVE, RECENCY, DURATION_MIN), scale2,
+                  .names = "scale_{col}"))
+```
+
+```{r}
+kclust <- kmeans(select(points, starts_with("scale")), centers = 3)
+summary(kclust) %>%  kable()
+aug <- augment(kclust, select(points, starts_with("scale"))) 
+totaldata <- points %>% bind_cols(aug) %>% select(c(PERC_ACTIVE, RECENCY, DURATION_MIN, .cluster))
+totaldata %>% paged_table()
+tidy(kclust) %>% 
+  mutate(
+    DURATION_MIN= scale_DURATION_MIN*sd(points$DURATION_MIN, na.rm = FALSE)+mean(points$DURATION_MIN, na.rm = FALSE),
+  RECENCY=scale_RECENCY*sd(points$RECENCY, na.rm = FALSE)+mean(points$RECENCY, na.rm = FALSE),
+  PERC_ACTIVE=scale_PERC_ACTIVE*sd(points$PERC_ACTIVE, na.rm = FALSE)+mean(points$PERC_ACTIVE, na.rm = FALSE)
+  ) %>%
+  kable()
+```
+
+```{r, out.width = '100%'}
+
+ggplot(totaldata, aes(x =RECENCY , y = PERC_ACTIVE)) +
+  geom_point(aes(color = .cluster), alpha = 0.1) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) 
+
+ggplot(totaldata, aes(x =DURATION_MIN , y = PERC_ACTIVE)) +
+  geom_point(aes(color = .cluster), alpha = 0.1)  + 
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  scale_x_continuous(trans='log2')
+
+ggplot(totaldata, aes(x =RECENCY , y = DURATION_MIN)) +
+  geom_point(aes(color = .cluster), alpha = 0.1)  +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  scale_y_continuous(trans='log2')
+```
+
+```{r, out.width = '100%'}
+totaldata %>% 
+  plot_ly( type="scatter3d", mode="markers", color=~.cluster) %>%
+  add_trace(
+    x=~RECENCY, y=~PERC_ACTIVE, z=~DURATION_MIN,
+    marker = list(
+      opacity = 0.1
+      ),
+    showlegend = F
+  ) 
+#  facet_wrap(~ k)
+```
+
+# Optimize number of clusters
+
+```{r}
+kclusts <- 
+  tibble(k = 1:9) %>%
+  mutate(
+    kclust = map(k, ~kmeans(select(aug, c(scale_DURATION_MIN, scale_RECENCY, scale_PERC_ACTIVE)), .x)),
+    tidied = map(kclust, tidy),
+    glanced = map(kclust, glance),
+    augmented = map(kclust, augment, points)
+  )
+
+clusters <- 
+  kclusts %>%
+  unnest(cols = c(tidied)) %>%
+  mutate(DURATION_MIN= scale_DURATION_MIN*sd(points$DURATION_MIN, na.rm = FALSE)+mean(points$DURATION_MIN, na.rm = FALSE),
+  RECENCY=scale_RECENCY*sd(points$RECENCY, na.rm = FALSE)+mean(points$RECENCY, na.rm = FALSE),
+  PERC_ACTIVE=scale_PERC_ACTIVE*sd(points$PERC_ACTIVE, na.rm = FALSE)+mean(points$PERC_ACTIVE, na.rm = FALSE)
+         )
+
+assignments <- 
+  kclusts %>% 
+  unnest(cols = c(augmented))
+
+clusterings <- 
+  kclusts %>%
+  unnest(cols = c(glanced))
+```
+
+```{r}
+clusters %>% paged_table()
+```
+
+```{r}
+p1 <- 
+  ggplot(assignments, aes(x = DURATION_MIN, y = PERC_ACTIVE)) +
+  geom_point(aes(color = .cluster), alpha = 0.1) + 
+  facet_wrap(~ k)
+
+```
+
+```{r, out.width = '100%'}
+p2 <- p1 + geom_point(data = clusters, size = 2, shape = "x")+ 
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))
+p2+scale_x_log10()
+
+ggplot(clusterings, aes(k, tot.withinss)) +
+  geom_line() +
+  geom_point()
+
+
+#df <- scale(points)
+#memory.limit(size = 83968)
+#fviz_nbclust(df, kmeans, method = "wss") +
+#    geom_vline(xintercept = 4, linetype = 2)+
+#  labs(subtitle = "Elbow method")
+```
